@@ -1,6 +1,7 @@
 from app.schemas.catalog import CatalogSearchResult
 from app.schemas.filtering import CandidateFilteringResult
 from app.schemas.normalization import NormalizationResult
+from app.schemas.orchestration import WorkflowResult, WorkflowStatus
 from app.schemas.recommendation import (
     RecommendationRequest,
     RecommendationResponse,
@@ -14,6 +15,7 @@ from app.services.constraint_relaxation import ConstraintRelaxationService
 from app.services.explanation_generation import ExplanationGenerationService
 from app.services.follow_up_questions import FollowUpQuestionService
 from app.services.input_validation import InputValidationService
+from app.services.logging_monitoring import LoggingMonitoringService
 from app.services.preference_normalization import PreferenceNormalizationService
 from app.services.response_formatter import ResponseFormatterService
 from app.services.scoring_ranking import ScoringRankingService
@@ -29,24 +31,41 @@ class RecommendationOrchestrator:
         self.explanation_generation = ExplanationGenerationService()
         self.scoring_ranking = ScoringRankingService()
         self.input_validator = InputValidationService()
+        self.monitoring = LoggingMonitoringService()
         self.preference_normalizer = PreferenceNormalizationService()
         self.follow_up_service = FollowUpQuestionService()
         self.response_formatter = ResponseFormatterService()
 
     def handle(self, request: RecommendationRequest) -> RecommendationResponse:
+        self.monitoring.record_request_started(
+            request_id=request.metadata.request_id,
+            session_id=request.metadata.session_id,
+        )
         validation_result = self.input_validator.validate(request)
         follow_up_decision = self.follow_up_service.decide(
             validation_result=validation_result
         )
         if follow_up_decision.should_ask:
+            workflow_result = self._build_follow_up_workflow_result(follow_up_decision)
+            self.monitoring.record_follow_up(
+                request_id=request.metadata.request_id,
+                session_id=request.metadata.session_id,
+                reason_codes=workflow_result.reason_codes,
+            )
             return self.response_formatter.build_follow_up_response(
                 follow_up_decision=follow_up_decision,
+                workflow_result=workflow_result,
                 request_id=request.metadata.request_id,
             )
 
         blocking_issues = self._get_blocking_validation_issues(validation_result)
         if blocking_issues:
             error_messages = [issue.message for issue in blocking_issues]
+            self.monitoring.record_validation_failure(
+                request_id=request.metadata.request_id,
+                session_id=request.metadata.session_id,
+                reason_codes=[issue.code for issue in blocking_issues],
+            )
             raise ValueError("; ".join(error_messages))
 
         normalization_result = self.preference_normalizer.normalize(request)
@@ -55,8 +74,15 @@ class RecommendationOrchestrator:
             normalization_result=normalization_result,
         )
         if follow_up_decision.should_ask:
+            workflow_result = self._build_follow_up_workflow_result(follow_up_decision)
+            self.monitoring.record_follow_up(
+                request_id=request.metadata.request_id,
+                session_id=request.metadata.session_id,
+                reason_codes=workflow_result.reason_codes,
+            )
             return self.response_formatter.build_follow_up_response(
                 follow_up_decision=follow_up_decision,
+                workflow_result=workflow_result,
                 request_id=request.metadata.request_id,
             )
         catalog_result = self.catalog_service.list_all()
@@ -90,17 +116,43 @@ class RecommendationOrchestrator:
             ranking_result=ranking_result,
             relaxation_result=relaxation_result,
         )
+        workflow_result = self._build_recommendation_workflow_result(
+            filtering_result=filtering_result,
+            ranking_result=ranking_result,
+            relaxation_result=relaxation_result,
+        )
+        alerts = self.monitoring.record_recommendation_completed(
+            request_id=request.metadata.request_id,
+            session_id=request.metadata.session_id,
+            candidate_count=filtering_result.summary.candidate_count,
+            top_score=(
+                ranking_result.ranked_candidates[0].final_score
+                if ranking_result.ranked_candidates
+                else None
+            ),
+            weak_match_count=sum(
+                1
+                for candidate in ranking_result.ranked_candidates
+                if candidate.weak_match_flags
+            ),
+            relaxation_applied=relaxation_result.applied,
+            workflow_reason_codes=workflow_result.reason_codes,
+        )
+        system_notes = self._build_system_notes(
+            request,
+            normalization_result,
+            catalog_result,
+            filtering_result,
+            ranking_result,
+            relaxation_result,
+        )
+        if alerts:
+            system_notes.extend(alert.message for alert in alerts)
 
         return self.response_formatter.build_recommendation_response(
             explanation_bundle=explanation_bundle,
-            system_notes=self._build_system_notes(
-                request,
-                normalization_result,
-                catalog_result,
-                filtering_result,
-                ranking_result,
-                relaxation_result,
-            ),
+            system_notes=system_notes,
+            workflow_result=workflow_result,
             request_id=request.metadata.request_id,
         )
 
@@ -137,6 +189,48 @@ class RecommendationOrchestrator:
             for index, record in enumerate(fallback_catalog)
         ]
         return RankingResult(ranked_candidates=fallback_ranked_candidates)
+
+    def _build_follow_up_workflow_result(
+        self,
+        follow_up_decision,
+    ) -> WorkflowResult:
+        reason_codes: list[str] = []
+        if follow_up_decision.question is not None:
+            reason_codes.append(follow_up_decision.question.code)
+        return WorkflowResult(
+            status=WorkflowStatus.FOLLOW_UP_REQUIRED,
+            reason_codes=reason_codes,
+        )
+
+    def _build_recommendation_workflow_result(
+        self,
+        *,
+        filtering_result: CandidateFilteringResult,
+        ranking_result: RankingResult,
+        relaxation_result: RelaxationResult,
+    ) -> WorkflowResult:
+        reason_codes: list[str] = ["recommendations_ready"]
+        if filtering_result.summary.candidate_count == 0:
+            reason_codes.append("no_direct_candidates")
+        elif filtering_result.summary.candidate_count < 3:
+            reason_codes.append("limited_candidates")
+
+        if relaxation_result.applied:
+            reason_codes.append("constraints_relaxed")
+
+        if ranking_result.ranked_candidates:
+            weak_match_count = sum(
+                1
+                for candidate in ranking_result.ranked_candidates
+                if candidate.weak_match_flags
+            )
+            if weak_match_count > 0:
+                reason_codes.append("weak_matches_present")
+
+        return WorkflowResult(
+            status=WorkflowStatus.RECOMMENDATIONS_READY,
+            reason_codes=reason_codes,
+        )
 
     def _build_system_notes(
         self,

@@ -14,6 +14,8 @@ Minimal FastAPI backend for the AI-assisted car recommendation MVP.
 - Constraint Relaxation Module: loosens constraints in a controlled order when matches are too few or weak, and records what was relaxed.
 - Explanation Generation Module: turns ranked candidates into user-facing reasons, tradeoffs, and alternative suggestion notes.
 - Response Formatter Module: assembles the final API response shape for both follow-up and recommendation scenarios.
+- Recommendation Orchestrator: drives the end-to-end workflow and now returns workflow status and reason codes along with the final response.
+- Logging and Monitoring Module: emits structured workflow logs, tracks in-memory metrics, and raises lightweight alerts for low-result or weak-match scenarios.
 
 ## Run
 

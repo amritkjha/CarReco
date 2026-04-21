@@ -3,6 +3,8 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.orchestration import WorkflowStatus
+
 
 class PrimaryUseCase(str, Enum):
     CITY_COMMUTE = "city_commute"
@@ -146,6 +148,8 @@ class RecommendationResponse(BaseModel):
     alternative_notes: list[str] = Field(default_factory=list)
     system_notes: list[str] = Field(default_factory=list)
     follow_up_question: FollowUpQuestion | None = None
+    workflow_status: WorkflowStatus
+    reason_codes: list[str] = Field(default_factory=list)
     request_id: str | None = None
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
